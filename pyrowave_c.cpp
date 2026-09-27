@@ -879,6 +879,10 @@ struct pyrowave_encoder_opaque
 	Fence queued_fence;
 	BufferHandle queued_meta;
 	BufferHandle queued_bitstream;
+	// GPU-side twins of queued_meta/queued_bitstream. All four are pooled across frames,
+	// since allocating them per frame dominates encode time at high frame rates.
+	BufferHandle queued_meta_gpu;
+	BufferHandle queued_bitstream_gpu;
 	ChromaSubsampling chroma = {};
 	int width = 0;
 	int height = 0;
@@ -886,7 +890,22 @@ struct pyrowave_encoder_opaque
 	// For scaling path.
 	ImageHandle scaler_planes[3];
 	VideoScaler scaler;
+
+	// The scaler's input view, kept while the caller passes the same image, since a streaming
+	// encoder samples the same few images every frame. The caller must keep an image alive
+	// while it may still be cached, i.e. until it's replaced or the encoder is destroyed.
+	ImageHandle scaler_input_image;
+	ImageViewHandle scaler_input_view;
+	pyrowave_image_view scaler_input_key = {};
 };
+
+static bool same_image_view(const pyrowave_image_view &a, const pyrowave_image_view &b)
+{
+	return a.image == b.image && a.width == b.width && a.height == b.height &&
+	       a.image_format == b.image_format && a.view_format == b.view_format &&
+	       a.mip_level == b.mip_level && a.layer == b.layer && a.aspect == b.aspect &&
+	       a.swizzle == b.swizzle && a.layout == b.layout;
+}
 
 pyrowave_result
 pyrowave_encoder_create(const pyrowave_encoder_create_info *info, pyrowave_encoder *encoder)
@@ -1031,42 +1050,43 @@ pyrowave_encoder_encode_gpu_synchronous_inner(pyrowave_encoder encoder,
 
 	Util::set_thread_logging_interface(&null_logger);
 
-	BufferCreateInfo bufinfo = {};
-	bufinfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-	                VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-	                VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-
-	bufinfo.size = encoder->encoder.get_meta_required_size();
-	bufinfo.domain = BufferDomain::CachedHost;
-	encoder->queued_meta = device->create_buffer(bufinfo);
-
-	if (!encoder->queued_meta)
-		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
-
-	bufinfo.domain = BufferDomain::Device;
-	auto queued_meta_gpu = device->create_buffer(bufinfo);
-
-	if (!queued_meta_gpu)
-		return PYROWAVE_ERROR_OUT_OF_DEVICE_MEMORY;
-
 	auto target_bitstream_size = rate_control->maximum_bitstream_size & ~VkDeviceSize(3u);
 
 	// Check for bogus sizes.
 	if (target_bitstream_size > UINT32_MAX || target_bitstream_size == 0)
 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
 
-	bufinfo.size = target_bitstream_size + encoder->encoder.get_meta_required_size();
-	bufinfo.domain = BufferDomain::CachedHost;
-	encoder->queued_bitstream = device->create_buffer(bufinfo);
+	const VkDeviceSize meta_size = encoder->encoder.get_meta_required_size();
+	const VkDeviceSize bitstream_size = target_bitstream_size + meta_size;
 
-	if (!encoder->queued_bitstream)
+	// The scratch buffers are only recreated when a larger size is needed. Reuse is safe since
+	// encoding is synchronous: packetize() waits for the fence before the next encode reuses them.
+	BufferCreateInfo bufinfo = {};
+	bufinfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+	                VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+	                VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+
+	auto ensure_buffer = [&](BufferHandle &handle, VkDeviceSize size, BufferDomain domain) -> bool {
+		if (!handle || handle->get_create_info().size < size)
+		{
+			bufinfo.size = size;
+			bufinfo.domain = domain;
+			handle = device->create_buffer(bufinfo);
+		}
+		return bool(handle);
+	};
+
+	if (!ensure_buffer(encoder->queued_meta, meta_size, BufferDomain::CachedHost))
 		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
-
-	bufinfo.domain = BufferDomain::Device;
-	auto queued_bitstream_gpu = device->create_buffer(bufinfo);
-
-	if (!queued_bitstream_gpu)
+	if (!ensure_buffer(encoder->queued_meta_gpu, meta_size, BufferDomain::Device))
 		return PYROWAVE_ERROR_OUT_OF_DEVICE_MEMORY;
+	if (!ensure_buffer(encoder->queued_bitstream, bitstream_size, BufferDomain::CachedHost))
+		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
+	if (!ensure_buffer(encoder->queued_bitstream_gpu, bitstream_size, BufferDomain::Device))
+		return PYROWAVE_ERROR_OUT_OF_DEVICE_MEMORY;
+
+	auto &queued_meta_gpu = encoder->queued_meta_gpu;
+	auto &queued_bitstream_gpu = encoder->queued_bitstream_gpu;
 
 	Encoder::BitstreamBuffers bitstream_buffers = {};
 
@@ -1282,15 +1302,22 @@ pyrowave_encoder_encode_gpu_scaled_synchronous(pyrowave_encoder encoder,
 	}
 	else if (format_ycbcr_num_planes(scaling_info->view.view_format) == 1)
 	{
-		ImageHandle wrapped_image;
-		ImageViewHandle wrapped_view;
-		if (!wrap_view(device, scaling_info->view, wrapped_image, wrapped_view, VK_IMAGE_USAGE_SAMPLED_BIT))
+		if (!encoder->scaler_input_view || !same_image_view(encoder->scaler_input_key, scaling_info->view))
 		{
-			device->submit_discard(cmd);
-			return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
+			encoder->scaler_input_view.reset();
+			encoder->scaler_input_image.reset();
+			if (!wrap_view(device, scaling_info->view, encoder->scaler_input_image, encoder->scaler_input_view,
+			               VK_IMAGE_USAGE_SAMPLED_BIT))
+			{
+				encoder->scaler_input_view.reset();
+				encoder->scaler_input_image.reset();
+				device->submit_discard(cmd);
+				return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
+			}
+			encoder->scaler_input_key = scaling_info->view;
 		}
 
-		info.input = wrapped_view.get();
+		info.input = encoder->scaler_input_view.get();
 		for (int i = 0; i < 3; i++)
 			info.output_planes[i] = &encoder->scaler_planes[i]->get_view();
 		info.num_output_planes = 3;
